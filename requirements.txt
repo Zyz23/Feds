@@ -1,0 +1,13 @@
+numpy>=1.21.0
+# torch==1.9.0  <-- 删除或注释掉这行
+# torchvision==0.7.0 <-- 删除或注释掉这行 (且原文件里0.7.0配1.9.0本身就是版本错配)
+six
+opencv-python
+transformers
+pytreebank
+tqdm
+datasets
+lmdb
+Pillow
+pyarrow
+msgpack
