@@ -20,8 +20,9 @@ MethodTable = {
     "fedadam":[MasterFedAdam, Worker],
     "fedadam_gkd":[MasterFedAdam, WorkerFedGKD],
     "fedensemble":[MasterFedEnsemble, Worker],
-    "fedhm":[MasterFedHM, WorkerFedHM]
+    "fedhm":[MasterFedHM, WorkerFedHM],
     # "fedhm":[MasterFedHM, Worker]
+    "fedour":[MasterFedOur, WorkerFedOur]
 
 }
 # 随机生成秩
@@ -29,7 +30,7 @@ MethodTable = {
 #     return np.random.uniform(0.2, 0.8, count)
 def random_rank_creater(count: int):
     # 定义可选的固定数值列表
-    candidate_values = np.array([0.5])
+    candidate_values = np.array([0.8])
     # 从候选值中随机选择count个（可重复选择，replace=True为默认值）
     return np.random.choice(candidate_values, size=count)
     

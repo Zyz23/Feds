@@ -17,7 +17,7 @@
 # from pcode.utils.early_stopping import EarlyStoppingTracker
 
 
-# class MasterFedHM(object):
+# class MasterFedOur(object):
 #     def __init__(self, conf):
 #         self.conf = conf
 
@@ -57,8 +57,7 @@
 # # 创建服务器模型 选取第一个客户端的全秩模型作为基准
 #         first_model_name, first_model_instance = self.client_models[1]
 #         self.master_model = copy.deepcopy(first_model_instance)
-#         print()
-#         self.master_model.recover_model() # 初始模型都是分解的 先恢复全职模型
+#         self.master_model.recover_model()
 
 
 #         # 确定每一个客户的具体使用的什么模型 只有名称 没有返回模型参数
@@ -576,11 +575,11 @@ from pcode.utils.early_stopping import EarlyStoppingTracker
 import torch.nn.utils as torch_utils
 from pcode.models.resnet import MetaBasicBlock
 from torch import nn
+import clip
 
-class MasterFedHM(object):
+class MasterFedOur(object):
     def __init__(self, conf):
         self.conf = conf
-
         # some initializations.
         self.client_ids = list(range(1, 1 + conf.n_clients))
         self.world_ids = list(range(1, 1 + conf.n_participated))
@@ -594,9 +593,14 @@ class MasterFedHM(object):
         # )
         # 恢复全局模型
 
+        self.text_model, _ = self.load_clip_text_model()
+        self.anchor = self.generate_text_anchors()
+        self.output_dim = self.anchor[0].shape[-1] 
+        conf.output_dim = self.output_dim
+        self.conf = conf
 
         self.used_client_archs =[create_model.determine_arch(conf, client_id, use_complex_arch=True) for client_id in range(1, 1 + conf.n_clients)]  # 所有客户端模型架构名称
-
+        
         
         self.conf.used_client_archs = self.used_client_archs
 
@@ -609,7 +613,7 @@ class MasterFedHM(object):
         ]
 
         # 拷贝构建全局模型
-        
+
         self.master_model = copy.deepcopy(self.client_models[0][1])
         if "resnet" in self.conf.arch:
             for m in self.master_model.modules():
@@ -700,6 +704,222 @@ class MasterFedHM(object):
         conf.is_finished = False    # 用于控制全局训练是否已经结束
         checkpoint.save_arguments(conf) # 将超参数保存在json文件中
 
+
+
+    def load_clip_text_model(self, model_name="ViT-B/32", save_dir="./model_state/"):
+        """
+        仅加载 CLIP 的文本提取部分。
+        
+        1. 自动检查本地/下载 (逻辑不变)。
+        2. 使用 jit=False 加载，以便我们可以修改模型结构。
+        3. 删除 visual 部分以节省显存。
+        """
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        print(f"Loading CLIP Text Backbone: {model_name}...")
+        
+        # [关键修改 1] jit=False: 允许我们将模型作为普通的 PyTorch nn.Module 加载，
+        # 这样我们才能执行 del model.visual 操作。
+        # model 的 preprocess (针对图像) 我们直接忽略，用不到。
+        model, _ = clip.load(model_name, device=device, download_root=save_dir, jit=False)
+        output_dim = model.text_projection.shape[1]
+        # [关键修改 2] 删除视觉编码器部分
+        # 这会释放掉 ViT 或 ResNet 部分占用的显存
+        if hasattr(model, 'visual'):
+            # 1. 先保存当前的数据类型 (通常是 float16 或 float32)
+            # 注意：如果 visual 已经被删了，这里会报错，所以要小心
+            try:
+                stored_dtype = model.visual.conv1.weight.dtype
+            except:
+                stored_dtype = torch.float16 # 默认备选
+                
+            # 2. 删除真正的视觉编码器 (释放显存)
+            del model.visual
+            if device == "cuda":
+                torch.cuda.empty_cache()
+                
+            # 3. [核心] 塞入一个假的 visual，只为了让 model.dtype 属性不报错
+            model.visual = DummyVisual(stored_dtype)
+                
+        print("Text-only model loaded. Visual encoder removed.")
+        
+        # 将模型设为评估模式 (对于文本部分这通常不影响，但好习惯)
+        model.eval()
+        model.to("cuda:7")
+
+        return model, device
+
+    def generate_text_anchors(self):
+        """
+        根据数据集名称生成文本锚点 (Text Anchors)。
+        
+        流程:
+        1. 获取类别名称列表 (classes).
+        2. 构造 Prompts (templates).
+        3. Tokenize -> Text Encoder -> Normalize.
+        """
+        
+        # 1. 获取当前设备
+        # 假设 self.text_model 已经在正确的 device 上 (比如 cpu 或 cuda)
+        device = next(self.text_model.parameters()).device
+        
+        # 2. 定义数据集与其对应的类别列表
+        # 这里列出了 CIFAR-10 和 CIFAR-100 的标准类别
+        data_classes_registry = {
+            "cifar10": [
+                "airplane", "automobile", "bird", "cat", "deer",
+                "dog", "frog", "horse", "ship", "truck"
+            ],
+            "cifar100": [
+                'apple', 'aquarium fish', 'baby', 'bear', 'beaver', 'bed', 'bee', 'beetle', 
+                'bicycle', 'bottle', 'bowl', 'boy', 'bridge', 'bus', 'butterfly', 'camel', 
+                'can', 'castle', 'caterpillar', 'cattle', 'chair', 'chimpanzee', 'clock', 
+                'cloud', 'cockroach', 'couch', 'crab', 'crocodile', 'cup', 'dinosaur', 
+                'dolphin', 'elephant', 'flatfish', 'forest', 'fox', 'girl', 'hamster', 
+                'house', 'kangaroo', 'keyboard', 'lamp', 'lawn_mower', 'leopard', 'lion', 
+                'lizard', 'lobster', 'man', 'maple_tree', 'motorcycle', 'mountain', 'mouse', 
+                'mushroom', 'oak_tree', 'orange', 'orchid', 'otter', 'palm_tree', 'pear', 
+                'pickup_truck', 'pine_tree', 'plain', 'plate', 'poppy', 'porcupine', 
+                'possum', 'rabbit', 'raccoon', 'ray', 'road', 'rocket', 'rose', 
+                'sea', 'seal', 'shark', 'shrew', 'skunk', 'skyscraper', 'snail', 'snake', 
+                'spider', 'squirrel', 'streetcar', 'sunflower', 'sweet_pepper', 'table', 
+                'tank', 'telephone', 'television', 'tiger', 'tractor', 'train', 'trout', 
+                'tulip', 'turtle', 'wardrobe', 'whale', 'willow_tree', 'wolf', 'woman', 'worm'
+            ],
+            # 你可以在这里添加 tinyimagenet 或其他数据集
+        }
+
+        dataset_name = self.conf.data.lower() # 确保大小写匹配
+        
+        if dataset_name not in data_classes_registry:
+            raise ValueError(f"Dataset '{dataset_name}' not found in registry. Please add class names to generate_text_anchors.")
+        
+        classes = data_classes_registry[dataset_name]
+        
+        # 3. 构造提示词 (Prompt Template)
+        # CLIP 官方推荐使用 "a photo of a {label}"
+        prompts = [f"a photo of a {c}" for c in classes]
+        
+
+        # 4. Tokenize
+        # clip.tokenize 会自动截断或填充到 77 token 长度
+        text_inputs = clip.tokenize(prompts).to(device)
+        
+        # 5. 提取特征 (Inference)
+        # 确保不计算梯度，确保模型处于 eval 模式
+        self.text_model.eval()
+        with torch.no_grad():
+            # encode_text 是 CLIP 模型提取文本特征的标准方法
+            x = self.text_model.token_embedding(text_inputs).type(self.text_model.dtype)
+            x = x + self.text_model.positional_embedding.type(self.text_model.dtype)
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            
+            # 2. 获取 Transformer 的层数
+            # ViT-B/32 的 layers=12
+            layers = self.text_model.transformer.resblocks
+            total_layers = len(layers)
+            
+            # 3. 定义我们要截取的节点 (均匀分布)
+            # 例如 12层 -> [2, 5, 8, 11] (索引从0开始)
+            # 这里的逻辑是：ResNet Stage1 对齐 Layer3，Stage4 对齐 Layer12
+            indices = [
+                int(total_layers * 1 / 4) - 1,
+                int(total_layers * 2 / 4) - 1,
+                int(total_layers * 3 / 4) - 1,
+                total_layers - 1
+            ]
+            
+            anchors_list = []
+            
+            # 4. 前向传播并截取
+            for i, layer in enumerate(layers):
+                x = layer(x)
+                
+                if i in indices:
+                    # 取出 [EOS] token 的特征 (就像 CLIP 标准做法一样)
+                    # x 形状: [L, Batch, Dim] -> permute -> [Batch, L, Dim]
+                    x_temp = x.permute(1, 0, 2)
+                    
+                    # text_inputs.argmax(dim=-1) 找到 EOS 的位置
+                    # 提取特征
+                    sent_emb = x_temp[torch.arange(x_temp.shape[0]), text_inputs.argmax(dim=-1)]
+                    
+                    # [关键]
+                    # 只有最后一层 (i == total_layers - 1) 需要通过 text_projection 映射到联合空间
+                    # 前面的层保持原样，或者也通过 LayerNorm
+                    if i == total_layers - 1:
+                        sent_emb = self.text_model.ln_final(sent_emb).type(self.text_model.dtype)
+                        sent_emb = sent_emb @ self.text_model.text_projection
+                    else:
+                        # 中间层通常不需要 ln_final，或者你可以选择加上
+                        pass 
+
+                    # 归一化 (一定要做!)
+                    sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
+                    anchors_list.append(sent_emb.float()) # 转回 float32
+
+            return anchors_list # 返回包含 4 个 Tensor 的列表
+
+### 只有在resnet下才能用这个函数
+
+    # def decom_recover_loss(self):
+    #     self.master_model.eval()
+    #     self.master_model.to('cuda')
+    #     old_state_dict = copy.deepcopy(self.master_model.state_dict())
+
+
+    #     for m in self.master_model.modules():
+    #             if isinstance(m, MetaBasicBlock):
+    #                 m.decom(100000000)
+
+
+    #     self.master_model.to('cuda')
+    #     for m in self.master_model.modules():
+    #             if isinstance(m, MetaBasicBlock):
+    #                 m.recover()
+        
+    #     new_state_dict = copy.deepcopy(self.master_model.state_dict())
+        
+    #     total_diff = 0.0
+    #     max_diff = 0.0
+
+    #     for key in old_state_dict:
+    #         # 只比较卷积层权重，跳过 num_batches_tracked 等统计量
+    #         if 'weight' in key or 'bias' in key:
+    #             w_old = old_state_dict[key].float()
+    #             # 确保 new_state_dict 里有这个 key (因为分解层结构变了又变回来，key 应该一致)
+    #             if key in new_state_dict:
+    #                 w_new = new_state_dict[key].float()
+    #                 # 计算两个张量的差异 (L1 距离)
+    #                 diff = (w_old - w_new).abs().sum().item()
+    #                 # 记录最大元素级误差
+    #                 current_max = (w_old - w_new).abs().max().item()
+                    
+    #                 total_diff += diff
+    #                 max_diff = max(max_diff, current_max)
+    #             else:
+    #                 print(f"⚠️ 警告: Key {key} 在还原后的模型中丢失！")
+
+    #     self.master_model.to('cpu')
+        
+    #     print(f"📊 检查结果:")
+    #     print(f"   累积总误差 (Sum Abs Diff): {total_diff:.4f}")
+    #     print(f"   最大单点误差 (Max Abs Diff): {max_diff:.6f}")
+    #     # 6. 自动判断
+    #     if max_diff < 1e-3:
+    #         print("✅ 成功: 还原误差极小。SVD 维度变换逻辑正确！")
+    #     else:
+    #         print("❌ 失败: 还原误差过大！")
+    #         print("   原因可能是：")
+    #         print("   1. decom/recover 里的 permute/view 维度搞反了 (最可能)。")
+    #         print("   2. decom 时传入的 Rank 太小，导致信息被大量截断。")
+    #     print("="*40 + "\n")
+
+    #     self.master_model.to('cpu')
 
     def run(self):
 
@@ -922,7 +1142,7 @@ class MasterFedHM(object):
 
         for selected_client_id in selected_client_ids:
             model = self.client_models[selected_client_id][1] # 取出模型对象
-            model.to('cuda')
+            model.to('cuda:7')
             # -----------------------------------------------------------
             # 【步骤 1：结构对齐】
             # 在加载参数前，必须先检查模型是否处于分解状态。
@@ -936,8 +1156,9 @@ class MasterFedHM(object):
                         if not isinstance(m.conv1, nn.Conv2d):
                             m.recover()
             elif "cnn" in self.conf.arch:
+            
                 model.recover_model()
-            model.to('cuda')
+            model.to('cuda:7')
             # -----------------------------------------------------------
             # 【步骤 2：加载全量参数】
             # 现在 model 结构和 master 一模一样了，可以安全加载
@@ -949,7 +1170,6 @@ class MasterFedHM(object):
             # 根据该客户端特定的 rank 进行 SVD 分解
             # -----------------------------------------------------------
             current_rank = rank_list[selected_client_id] # 获取该客户端对应的 rank (或 ratio)
-            
             if "resnet" in self.conf.arch:
                 for m in model.modules():
                     if isinstance(m, MetaBasicBlock):
@@ -959,37 +1179,6 @@ class MasterFedHM(object):
                 model.decom_model(current_rank)
             model.to('cpu')
 
-
-    # def recover_aggrevate(self, selected_client_ids):
-    #     # 1. 定义权重 (Origin逻辑: 默认为均匀平均)
-    #     n_selected_clients = len(selected_client_ids)
-    #     weights = [1.0 / n_selected_clients for _ in range(n_selected_clients)]
-
-    #     # 2. 将所有选中的客户端模型状态封装为 ModuleState 对象
-    #     # 这完全对应 Origin 代码中的 local_states = [ModuleState(...) for ...]
-    #     local_states = []
-    #     for client_id in selected_client_ids:
-    #         # Modified 版本中模型存储在 list 的元组里，取 [1]
-    #         local_model = self.client_models[client_id][1]
-    #         # 关键：使用 deepcopy 确保数据独立，防止引用修改
-    #         local_states.append(ModuleState(copy.deepcopy(local_model.state_dict())))
-
-    #     # 3. 执行加权聚合 (完全照搬 Origin 的数学逻辑)
-    #     # model_state = state[0] * w[0] + state[1] * w[1] + ...
-    #     model_state = local_states[0] * weights[0]
-        
-    #     for idx in range(1, len(local_states)):
-    #         model_state += local_states[idx] * weights[idx]
-
-    #     # 4. 将聚合后的状态复制回模型对象
-    #     # 取第一个客户端的模型作为结构底板 (template)
-    #     base_client_id = selected_client_ids[0]
-    #     aggregated_model = copy.deepcopy(self.client_models[base_client_id][1])
-        
-    #     # 使用 ModuleState 自带的 copy_to_module 方法
-    #     model_state.copy_to_module(aggregated_model)
-
-    #     return aggregated_model
 
     # def recover_aggrevate(self, selected_client_ids):
     #     """
@@ -1289,3 +1478,11 @@ def get_n_local_epoch(conf, n_participated):
             low=conf.min_local_epochs, high=conf.local_n_epochs, size=n_participated
         )
         return random_local_n_epochs
+    
+class DummyLayer:
+    def __init__(self, dtype):
+        self.weight = type('DummyTensor', (), {'dtype': dtype})()
+
+class DummyVisual:
+    def __init__(self, dtype):
+        self.conv1 = DummyLayer(dtype)
