@@ -337,7 +337,7 @@ class MetaCNN(nn.Module):
             self.fc1 = Recover_LINEAR(self.fc1)
             print(" -> fc1 recovered.")
             
-        # self.rank_rate = 1.0
+        self.rank_rate = 1.0
 
     # === 正则化 Loss 计算 (用于低秩训练阶段) ===
     
